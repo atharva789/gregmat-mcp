@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.session.json
+session.json
+.gregmat-mcp/
+*.log
+.DS_Store
+coverage/

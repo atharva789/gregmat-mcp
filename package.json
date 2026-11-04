@@ -1,0 +1,43 @@
+{
+  "name": "gregmat-mcp",
+  "version": "0.1.0",
+  "description": "Local, read-only MCP server exposing your GregMAT GRE prep progress plus a local study log.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "gregmat-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    ".env.example"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
+    "start": "node dist/index.js",
+    "check": "node dist/index.js --self-test",
+    "test": "node test/smoke.mjs",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "gregmat",
+    "gre",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "optionalDependencies": {
+    "playwright": "^1.56.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "^5.9.3"
+  }
+}
