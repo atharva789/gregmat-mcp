@@ -1,15 +1,19 @@
 /** MCP tool registrations. All GregMAT access is GET-only; local-log tools write only to the local JSON file. */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { GregmatClient } from "./api.js";
 import {
-  HIGH_YIELD_TOPICS, RAW_GET_ALLOWED_PREFIXES, RAW_GET_DENY_FRAGMENTS, defaultStudyPlan, logFile, testDate,
-} from "./config.js";
+  GroupStat, bestPercent, byCategory, bySection, byTopic, byType, isAttempted, pct, questionActivityDates, quizActivityDates, quizTaken,
+  summarizeQuizzes, untouchedTopics, weakestFirst,
+} from "./analytics.js";
+import { GregmatClient } from "./api.js";
+import { QUIZ_SOURCES, RAW_GET_ALLOWED_PREFIXES, RAW_GET_DENY_FRAGMENTS, logFile, testDate } from "./config.js";
 import { CONFIG_HINT, ToolError, toToolError } from "./errors.js";
-import { Fetched, capRaw, fetchProfile, fetchQuestions, fetchQuizzes, fetchStats, fetchStudyPlan } from "./gregmat.js";
+import {
+  Fetched, capRaw, defaultPlan, fetchPlan, fetchPlanList, fetchProfile, fetchQuestions, fetchQuizzes, fetchSiteTotals, fetchSkillStats,
+  fetchTagCounts,
+} from "./gregmat.js";
 import { LogEntry, addEntry, aggregate, filterEntries, normalizeDateInput, readLog } from "./localLog.js";
-import { Question, Section, computeStreak, daysUntil, describeShape, localDay } from "./normalize.js";
-import { ScraperUnavailableError, scrapeSectionalTests } from "./scraper.js";
+import { Section, StudyUnit, computeStreak, daysUntil, describeShape, localDay, topicTags } from "./normalize.js";
 
 type Json = Record<string, unknown>;
 const MAX_OUTPUT_CHARS = 120_000;
@@ -20,10 +24,6 @@ export function jsonResult(obj: unknown, isError = false) {
     text = text.slice(0, MAX_OUTPUT_CHARS) + `\n… [truncated ${text.length - MAX_OUTPUT_CHARS} chars; narrow your query]`;
   }
   return { content: [{ type: "text" as const, text }], ...(isError ? { isError: true } : {}) };
-}
-
-function errorsOf(...fs: Fetched<unknown>[]): ToolError[] {
-  return fs.filter((f): f is { ok: false; error: ToolError } => !f.ok).map((f) => f.error);
 }
 
 /** Wrap a handler so nothing ever throws out to the transport. */
@@ -53,6 +53,9 @@ function testInfo() {
 const sectionEnum = z.enum(["quant", "verbal", "awa"]);
 const dateStr = z.string().describe("Date YYYY-MM-DD (local)");
 
+const authError = (client: GregmatClient): Promise<ToolError | null> => client.auth.getToken().then(() => null, (e) => toToolError(e));
+const round1 = (n: number) => Math.round(n * 10) / 10;
+
 // ---------------------------------------------------------------------------
 // Completed-item helpers
 // ---------------------------------------------------------------------------
@@ -64,8 +67,13 @@ interface CompletedItem {
   section: Section | string;
   topic?: string | null;
   tags?: string[];
+  question_type?: string | null;
+  difficulty?: string | null;
   status?: string;
+  /** For problems: correctness of the FIRST attempt. */
   correct?: boolean | null;
+  attempts?: number;
+  group?: string | null;
   score?: number | null;
   percent?: number | null;
   date: string | null;
@@ -93,29 +101,83 @@ function localToItem(e: LogEntry): CompletedItem {
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostics helpers
+// Study-plan progress (shared by get_study_plan_progress and get_progress_summary)
 // ---------------------------------------------------------------------------
-interface TopicStat {
-  topic: string;
-  section: Section | string;
-  attempted: number;
-  graded: number;
-  correct: number;
-  accuracy: number | null;
-  available: number;
-  sources: string[];
+interface PlanProgress {
+  slug: string;
+  title: string | null;
+  modules: { slug: string; title: string | null; index: number | null; done: number; total: number }[];
+  done: number;
+  total: number;
+  percent: number | null;
+  doneUnits: StudyUnit[];
+  /** Done units of other plans when the default plan has none (so "video" items reflect the plan in use). */
+  otherDoneUnits: StudyUnit[];
+  remainingUnits: StudyUnit[];
+  planInUse: boolean;
+  otherPlansWithProgress: { slug: string; title: string | null; done: number; total: number; percent: number | null }[];
+  note?: string;
+  warnings: string[];
 }
 
-function pct(n: number, d: number): number | null {
-  return d ? Math.round((n / d) * 1000) / 10 : null;
-}
-
-/** For a question: did the user get it right? Uses explicit `correct`, else solved=right / attempted-not-solved=wrong (proxy). */
-function questionOutcome(q: Question): { attempted: boolean; graded: boolean; correct: boolean; proxy: boolean } {
-  if (q.correct !== null) return { attempted: true, graded: true, correct: q.correct, proxy: false };
-  if (q.status === "solved") return { attempted: true, graded: true, correct: true, proxy: true };
-  if (q.status === "attempted") return { attempted: true, graded: true, correct: false, proxy: true };
-  return { attempted: false, graded: false, correct: false, proxy: false };
+async function planProgress(client: GregmatClient, slugArg: string | undefined): Promise<Fetched<PlanProgress>> {
+  const slug = slugArg ?? defaultPlan();
+  const list = await fetchPlanList(client);
+  const plans = list.ok ? list.data : [];
+  let main = await fetchPlan(client, slug, plans);
+  const warnings = list.ok ? [] : [`plan list unavailable: ${list.error.error}`];
+  if (!main.ok) {
+    // Default plan missing/unreachable: still look for the plan in use among the others.
+    if (slugArg || plans.length === 0) return main;
+    warnings.push(`default plan "${slug}" unavailable: ${main.error.error}`);
+    main = { ok: true, endpoint: `/studyplans/${slug}/`, data: { slug, title: null, modules: [], warnings: [] } };
+  }
+  warnings.push(...main.data.warnings);
+  const summarize = (d: { slug: string; title: string | null; modules: { units: StudyUnit[] }[] }) => {
+    const units = d.modules.flatMap((m) => m.units);
+    const done = units.filter((u) => u.done).length;
+    return { units, done, total: units.length };
+  };
+  const m = summarize(main.data);
+  const others: PlanProgress["otherPlansWithProgress"] = [];
+  const otherDoneUnits: StudyUnit[] = [];
+  let note: string | undefined;
+  if (m.done === 0 && !slugArg) {
+    // Default plan untouched: look for the plan(s) actually in use.
+    for (const p of plans.filter((x) => x.role === "plan" && x.slug !== slug)) {
+      const r = await fetchPlan(client, p.slug, plans);
+      if (!r.ok) continue;
+      const s = summarize(r.data);
+      if (s.done > 0) {
+        others.push({ slug: p.slug, title: r.data.title, done: s.done, total: s.total, percent: pct(s.done, s.total) });
+        otherDoneUnits.push(...s.units.filter((u) => u.done));
+      }
+    }
+    note = others.length
+      ? `No units done in the default plan "${slug}"; other plan(s) have progress: ${others.map((o) => o.slug).join(", ")}. Pass \`slug\` to inspect one.`
+      : "No plan progress recorded (no study-plan unit is marked done in any plan).";
+  } else if (m.done === 0) {
+    note = `No units done in "${slug}".`;
+  }
+  return {
+    ok: true,
+    endpoint: main.endpoint,
+    data: {
+      slug,
+      title: main.data.title,
+      modules: main.data.modules.map((mod) => ({ slug: mod.slug, title: mod.title, index: mod.index, done: mod.units.filter((u) => u.done).length, total: mod.units.length })),
+      done: m.done,
+      total: m.total,
+      percent: pct(m.done, m.total),
+      doneUnits: m.units.filter((u) => u.done),
+      remainingUnits: m.units.filter((u) => !u.done),
+      planInUse: m.done > 0,
+      otherPlansWithProgress: others,
+      otherDoneUnits,
+      note,
+      warnings,
+    },
+  };
 }
 
 export function registerTools(server: McpServer, client: GregmatClient): void {
@@ -124,7 +186,7 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
     "get_profile",
     {
       title: "GregMAT profile",
-      description: "Read the logged-in GregMAT user's profile (name, email, subscription, ids) from /authentication/me/. Read-only.",
+      description: "Read the logged-in GregMAT user's profile (name, email, Plus status, subscription) from /authentication/me/. Read-only.",
       inputSchema: { include_raw_shape: z.boolean().optional().describe("Include the raw response's key structure") },
     },
     safe(async ({ include_raw_shape }: { include_raw_shape?: boolean }) => {
@@ -132,7 +194,7 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
       if (!r.ok) return jsonResult(r.error, true);
       return jsonResult({
         profile: r.data.profile,
-        auth: { source: client.auth.info.source, login_variant: client.auth.info.loginVariant ?? null, token_expires_at: client.auth.info.tokenExpiresAt ?? null },
+        auth: { source: client.auth.info.source, token_expires_at: client.auth.info.tokenExpiresAt ?? null },
         ...(include_raw_shape ? { raw_shape: r.data.raw_shape } : {}),
       });
     }),
@@ -144,87 +206,69 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
     {
       title: "Progress summary",
       description:
-        "Combined GRE prep progress: GregMAT problem-solving stats (/ps/stats/), per-question solved counts by section/topic (/ps/questions/), skill-building stats (/sb/stats/me/), study plan completion, and the local log. Includes last activity, streak and days until the test date.",
+        "Combined GRE prep progress: solved/attempted counts per section, category and topic (from /ps/questions/ attempts), quiz and skill-building stats, study-plan completion, local log, last activity and streak (from answered_at dates), days until the test date.",
       inputSchema: {
-        study_plan: z.string().optional().describe("Study plan slug (default GREGMAT_STUDY_PLAN or the-im-overwhelmed-study-plan)"),
-        max_questions: z.number().int().min(0).max(5000).optional().describe("Max questions to scan from /ps/questions/ (default 1500, 0 = skip)"),
+        study_plan: z.string().optional().describe("Parent study plan slug (default GREGMAT_STUDY_PLAN or the-im-overwhelmed-study-plan)"),
+        refresh: z.boolean().optional().describe("Bypass the 5-minute /ps/questions cache"),
       },
     },
-    safe(async ({ study_plan, max_questions }: { study_plan?: string; max_questions?: number }) => {
-      const slug = study_plan ?? defaultStudyPlan();
-      const maxQ = max_questions ?? 1500;
+    safe(async ({ study_plan, refresh }: { study_plan?: string; refresh?: boolean }) => {
       const log = safeReadLog();
-      const authOk = await client.auth.getToken().then(() => null, (e) => toToolError(e));
-
+      const authErr = await authError(client);
       const out: Json = { ...testInfo() };
       const errors: ToolError[] = [];
       const activityDates: (string | null)[] = log.entries.map((e) => e.date);
 
-      if (authOk) {
-        errors.push(authOk);
-      } else {
-        const [ps, sb, plan, qs] = await Promise.all([
-          fetchStats(client, "psStats"),
-          fetchStats(client, "sbStats"),
-          fetchStudyPlan(client, slug),
-          maxQ > 0 ? fetchQuestions(client, maxQ) : Promise.resolve(null),
+      if (authErr) errors.push(authErr);
+      else {
+        const [totals, sb, plan, qs, quizzes] = await Promise.all([
+          fetchSiteTotals(client),
+          fetchSkillStats(client),
+          planProgress(client, study_plan),
+          fetchQuestions(client, { refresh }),
+          fetchQuizzes(client),
         ]);
-        errors.push(...errorsOf(ps, sb, plan, ...(qs ? [qs] : [])));
+        for (const f of [totals, sb, plan, qs, quizzes]) if (!f.ok) errors.push(f.error);
         const gm: Json = {};
-        if (ps.ok) gm.problem_solving_stats = { numbers: ps.data.numbers, raw: ps.data.raw };
-        if (sb.ok) gm.skill_building_stats = { numbers: sb.data.numbers, raw: sb.data.raw };
-        if (plan.ok) {
-          const units = plan.data.plan.units;
-          const done = units.filter((u) => u.done === true).length;
-          gm.study_plan = {
-            slug,
-            title: plan.data.plan.title,
-            done,
-            total: units.length,
-            percent: pct(done, units.length),
-            ...(plan.data.plan.shape_note ? { note: plan.data.plan.shape_note, raw_shape: plan.data.raw_shape } : {}),
-          };
-          activityDates.push(...units.filter((u) => u.done).map((u) => u.date));
-        }
-        if (qs && qs.ok) {
-          const bySection: Record<string, { solved: number; attempted: number; total_seen: number }> = {};
-          const byTopic: Record<string, { solved: number; attempted: number }> = {};
-          for (const q of qs.data.questions) {
-            const s = (bySection[q.section] ??= { solved: 0, attempted: 0, total_seen: 0 });
-            s.total_seen++;
-            if (q.status === "solved") s.solved++;
-            if (q.status === "solved" || q.status === "attempted") s.attempted++;
-            if (q.status === "solved" || q.status === "attempted") {
-              for (const t of q.tags.length ? q.tags : ["(untagged)"]) {
-                const tt = (byTopic[t] ??= { solved: 0, attempted: 0 });
-                tt.attempted++;
-                if (q.status === "solved") tt.solved++;
-              }
-              activityDates.push(q.date);
-            }
-          }
+        if (totals.ok) gm.site_totals = totals.data;
+        if (qs.ok) {
+          const questions = qs.data.questions;
+          const attempted = questions.filter(isAttempted);
+          const view = (g: GroupStat) => ({ name: g.name, section: g.section, solved: g.solved, attempted: g.attempted, total: g.total, first_attempt_accuracy: g.accuracy });
           gm.questions = {
-            scanned: qs.data.fetched,
-            total_reported: qs.data.total_reported,
-            truncated: qs.data.truncated,
-            per_user_status_detected: qs.data.status_known,
-            by_section: bySection,
-            by_topic: byTopic,
-            ...(qs.data.status_known ? {} : { note: `No per-user solved/attempted flags recognised; first page keys: ${qs.data.first_page_keys.join(", ")}. ${CONFIG_HINT} / normalize.ts` }),
+            total_questions: questions.length,
+            solved: questions.filter((q) => q.status === "solved").length,
+            attempted: attempted.length,
+            by_section: bySection(questions).map(view),
+            by_category: byCategory(questions).sort((a, b) => b.attempted - a.attempted).map(view),
+            by_topic: byTopic(questions).filter((g) => g.attempted > 0).sort((a, b) => b.attempted - a.attempted).map(view),
+            cached: qs.data.from_cache,
+            fetched_at: qs.data.fetched_at,
+            ...(qs.data.warnings.length ? { warnings: qs.data.warnings } : {}),
           };
+          activityDates.push(...questionActivityDates(questions));
+        }
+        if (quizzes.ok) {
+          gm.quizzes = { by_section: summarizeQuizzes(quizzes.data.quizzes), sources: quizzes.data.sources };
+          activityDates.push(...quizActivityDates(quizzes.data.quizzes));
+        }
+        if (sb.ok) gm.skill_building = sb.data;
+        if (plan.ok) {
+          const p = plan.data;
+          gm.study_plan = { slug: p.slug, title: p.title, done: p.done, total: p.total, percent: p.percent, plan_in_use: p.planInUse, ...(p.note ? { note: p.note } : {}), ...(p.otherPlansWithProgress.length ? { other_plans_with_progress: p.otherPlansWithProgress } : {}) };
+          activityDates.push(...p.doneUnits.map((u) => u.date));
         }
         out.gregmat = gm;
       }
 
-      const agg = aggregate(filterEntries(log.entries));
-      out.local_log = { entries: log.entries.length, ...agg, ...(log.error ? { error: log.error } : {}) };
+      out.local_log = { entries: log.entries.length, ...aggregate(filterEntries(log.entries)), ...(log.error ? { error: log.error } : {}) };
       const streak = computeStreak(activityDates);
       out.activity = {
         last_activity: streak.last_activity,
         current_streak_days: streak.current,
         longest_streak_days: streak.longest,
         active_days: streak.active_days,
-        note: "Streak uses dated activity from GregMAT (where dates are exposed) plus the local log.",
+        note: "From answered_at dates of problem/quiz attempts plus local-log dates (day boundaries in the server's local time zone).",
       };
       if (errors.length) out.errors = errors;
       return jsonResult(out);
@@ -237,14 +281,16 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
     {
       title: "Completed items",
       description:
-        "List completed/attempted GregMAT items: solved problems (/ps/questions/), quiz attempts (/quizzes/quiz/), study-plan units marked done (type 'video'), skill-building stats (type 'skill'), merged with local-log entries. Sorted newest first.",
+        "List completed/attempted GregMAT items, newest first: problems with attempts (/ps/questions/; one row per question, correct = first attempt), quiz attempts, study-plan units marked done (type 'video'), skill-building drill totals (type 'skill'), merged with local-log entries.",
       inputSchema: {
         type: z.enum(["problem", "quiz", "video", "skill", "all"]).optional().describe("Item type filter (default all)"),
-        since: dateStr.optional().describe("Only items dated on/after this date (YYYY-MM-DD). Undated GregMAT items are excluded when set."),
+        since: dateStr.optional().describe("Only items dated on/after this date (YYYY-MM-DD). Undated items (plan units, skill totals) are excluded when set."),
+        section: z.enum(["quant", "verbal"]).optional().describe("Only problems/quizzes of this section"),
         limit: z.number().int().min(1).max(1000).optional().describe("Max items returned (default 100)"),
+        refresh: z.boolean().optional().describe("Bypass the 5-minute /ps/questions cache"),
       },
     },
-    safe(async ({ type, since, limit }: { type?: string; since?: string; limit?: number }) => {
+    safe(async ({ type, since, section, limit, refresh }: { type?: string; since?: string; section?: string; limit?: number; refresh?: boolean }) => {
       const want = type ?? "all";
       const lim = limit ?? 100;
       const sinceDay = since ? normalizeDateInput(since) : null;
@@ -253,39 +299,41 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
       const errors: ToolError[] = [];
       const log = safeReadLog();
 
-      const authErr = await client.auth.getToken().then(() => null, (e) => toToolError(e));
+      const authErr = await authError(client);
       if (authErr) errors.push(authErr);
       else {
         const [qs, quizzes, plan, sb] = await Promise.all([
-          has("problem") ? fetchQuestions(client) : null,
-          has("quiz") ? fetchQuizzes(client, {}) : null,
-          has("video") ? fetchStudyPlan(client, defaultStudyPlan()) : null,
-          has("skill") ? fetchStats(client, "sbStats") : null,
+          has("problem") ? fetchQuestions(client, { refresh }) : null,
+          has("quiz") ? fetchQuizzes(client) : null,
+          has("video") ? planProgress(client, undefined) : null,
+          has("skill") ? fetchSkillStats(client) : null,
         ]);
         for (const f of [qs, quizzes, plan, sb]) if (f && !f.ok) errors.push(f.error);
         if (qs?.ok) {
           for (const q of qs.data.questions) {
-            if (q.status !== "solved" && q.status !== "attempted") continue;
-            items.push({ type: "problem", source: "gregmat", title: q.title, slug: q.slug, section: q.section, tags: q.tags, status: q.status, correct: q.correct, date: q.date });
+            if (!isAttempted(q)) continue;
+            items.push({
+              type: "problem", source: "gregmat", title: q.title, slug: q.slug, section: q.section, topic: q.category,
+              tags: topicTags(q).map((t) => t.title), question_type: q.type, difficulty: q.difficulty, status: q.status,
+              correct: q.first_attempt_correct, attempts: q.attempts.length, date: q.last_attempt_at,
+            });
           }
         }
         if (quizzes?.ok) {
           for (const z of quizzes.data.quizzes) {
-            if (!(z.completed || (z.attempts ?? 0) > 0 || z.score !== null)) continue;
-            items.push({ type: "quiz", source: "gregmat", title: z.title, slug: z.slug, section: z.section, score: z.score, percent: z.percent, date: z.date });
+            for (const a of z.attempts) {
+              items.push({ type: "quiz", source: "gregmat", title: z.title, slug: z.slug, section: z.section, group: z.group, score: a.score, percent: a.percent, date: a.date });
+            }
           }
         }
         if (plan?.ok) {
-          for (const u of plan.data.plan.units) {
-            if (u.done !== true) continue;
-            items.push({ type: "video", source: "gregmat", title: u.title, slug: u.id, section: u.section, topic: u.day, date: u.date });
+          for (const u of [...plan.data.doneUnits, ...plan.data.otherDoneUnits]) {
+            items.push({ type: "video", source: "gregmat", title: u.title, slug: u.id, section: "unknown", topic: u.module_title, date: u.date });
           }
         }
         if (sb?.ok) {
-          for (const [k, v] of Object.entries(sb.data.numbers)) {
-            if (v > 0 && /complet|done|solved|correct|count|answered|total/i.test(k)) {
-              items.push({ type: "skill", source: "gregmat", title: k, section: "verbal", score: v, date: null });
-            }
+          for (const s of sb.data) {
+            if ((s.total_attempts ?? 0) > 0) items.push({ type: "skill", source: "gregmat", title: s.kind, section: "verbal", attempts: s.total_attempts ?? 0, percent: s.first_attempt_accuracy, date: null });
           }
         }
       }
@@ -294,10 +342,10 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
         if (has(it.type)) items.push(it);
       }
 
-      let filtered = items;
+      let filtered = section ? items.filter((i) => i.type === "video" || i.type === "skill" || i.section === section) : items;
       let undatedExcluded = 0;
       if (sinceDay) {
-        filtered = items.filter((i) => {
+        filtered = filtered.filter((i) => {
           if (!i.date) {
             undatedExcluded++;
             return false;
@@ -309,7 +357,7 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
       const counts: Record<string, number> = {};
       for (const i of filtered) counts[`${i.source}:${i.type}`] = (counts[`${i.source}:${i.type}`] ?? 0) + 1;
       return jsonResult({
-        filter: { type: want, since: sinceDay, limit: lim },
+        filter: { type: want, since: sinceDay, section: section ?? null, limit: lim },
         total_matching: filtered.length,
         counts,
         ...(undatedExcluded ? { undated_excluded: undatedExcluded } : {}),
@@ -325,30 +373,38 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
     "get_quiz_results",
     {
       title: "Quiz results",
-      description:
-        "Scores/attempts per quiz. `slug` → /ps/quiz/{slug}/; `group` → /ps/quizgroup/{group}/ (falls back to /ps/quizsupergroup/); neither → /quizzes/quiz/ listing. Local-log quiz entries are included.",
+      description: `Scores/attempts per quiz, aggregated from: ${QUIZ_SOURCES.map((s) => `${s.label} (/ps/${s.kind}/${s.slug}/)`).join("; ")}. Filter by quiz \`slug\`, source/group (\`group\`: source slug or group-title substring), or \`taken_only\`. Local-log quiz entries are included.`,
       inputSchema: {
         slug: z.string().optional().describe("Quiz slug"),
-        group: z.string().optional().describe("Quiz group or super-group slug"),
-        include_raw_shape: z.boolean().optional(),
+        group: z.string().optional().describe(`Source slug (${QUIZ_SOURCES.map((s) => s.slug).join(", ")}) or part of a quiz group title`),
+        taken_only: z.boolean().optional().describe("Only quizzes with at least one attempt (default false)"),
       },
     },
-    safe(async ({ slug, group, include_raw_shape }: { slug?: string; group?: string; include_raw_shape?: boolean }) => {
+    safe(async ({ slug, group, taken_only }: { slug?: string; group?: string; taken_only?: boolean }) => {
       const log = safeReadLog();
       const localQuizzes = log.entries.filter((e) => localEntryType(e) === "quiz").map(localToItem);
-      const r = await fetchQuizzes(client, { slug, group });
+      const r = await fetchQuizzes(client);
       if (!r.ok) return jsonResult({ ...r.error, local_log_quizzes: localQuizzes }, true);
-      const qz = r.data.quizzes;
-      const taken = qz.filter((q) => q.completed || (q.attempts ?? 0) > 0 || q.score !== null);
-      const pcts = taken.map((q) => q.percent).filter((p): p is number => p !== null);
+      const g = group?.toLowerCase();
+      let qz = r.data.quizzes;
+      if (slug) qz = qz.filter((q) => q.slug === slug);
+      if (g) qz = qz.filter((q) => q.source.toLowerCase() === g || (q.group ?? "").toLowerCase().includes(g) || q.source.toLowerCase().includes(g));
+      const all = qz;
+      if (taken_only) qz = qz.filter(quizTaken);
+      const taken = all.filter(quizTaken);
+      const bests = taken.map(bestPercent).filter((p): p is number => p !== null);
       return jsonResult({
-        source: r.data.source,
-        quizzes_found: qz.length,
+        sources: r.data.sources,
+        quizzes_found: all.length,
         quizzes_taken: taken.length,
-        average_percent: pcts.length ? Math.round((pcts.reduce((a, b) => a + b, 0) / pcts.length) * 10) / 10 : null,
-        quizzes: qz,
+        average_best_percent: bests.length ? round1(bests.reduce((a, b) => a + b, 0) / bests.length) : null,
+        by_section: summarizeQuizzes(all),
+        quizzes: qz.map((q) => ({
+          title: q.title, slug: q.slug, group: q.group, source: q.source, section: q.section, minutes: q.minutes, max_score: q.max_score,
+          site_mean_score: q.mean_score, acceptance: q.acceptance, plus_only: q.plus_only,
+          attempts_count: q.attempts.length, best_percent: bestPercent(q), attempts: q.attempts,
+        })),
         local_log_quizzes: localQuizzes,
-        ...(include_raw_shape || qz.length === 0 ? { raw_shape: r.data.raw_shape } : {}),
       });
     }),
   );
@@ -359,130 +415,59 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
     {
       title: "Diagnostics (derived)",
       description:
-        "DERIVED diagnostics (GregMAT has no diagnostic endpoint): accuracy by tag/topic and Quant vs Verbal from per-question results (/ps/questions/), quiz scores, and the local log; weakest N topics; unattempted high-yield topics. Optionally scrapes the sectional-tests page via Playwright.",
+        "DERIVED diagnostics (GregMAT has no diagnostic endpoint): first-attempt accuracy by category (first_tlc), question type and topic tag from /ps/questions/ attempts, weakest first, plus topics not yet touched; quiz averages and skill-building accuracy.",
       inputSchema: {
         weakest_n: z.number().int().min(1).max(30).optional().describe("How many weakest topics to return (default 5)"),
-        min_attempts: z.number().int().min(1).max(100).optional().describe("Minimum graded attempts for a topic to be ranked (default 3)"),
-        include_sectional_tests: z.boolean().optional().describe("Try the Playwright scraper on /practice/sectional-tests/ (default false)"),
+        min_attempts: z.number().int().min(1).max(100).optional().describe("Minimum first attempts for a group to be ranked (default 3)"),
+        refresh: z.boolean().optional().describe("Bypass the 5-minute /ps/questions cache"),
       },
     },
-    safe(async ({ weakest_n, min_attempts, include_sectional_tests }: { weakest_n?: number; min_attempts?: number; include_sectional_tests?: boolean }) => {
+    safe(async ({ weakest_n, min_attempts, refresh }: { weakest_n?: number; min_attempts?: number; refresh?: boolean }) => {
       const n = weakest_n ?? 5;
       const minA = min_attempts ?? 3;
       const errors: ToolError[] = [];
       const log = safeReadLog();
-      const topics = new Map<string, TopicStat>();
-      const sections: Record<string, { attempted: number; graded: number; correct: number; accuracy: number | null }> = {};
-      let proxyUsed = false;
-
-      const topicFor = (topic: string, section: string) => {
-        const key = topic.toLowerCase();
-        let t = topics.get(key);
-        if (!t) {
-          t = { topic, section, attempted: 0, graded: 0, correct: 0, accuracy: null, available: 0, sources: [] };
-          topics.set(key, t);
-        }
-        if (t.section === "unknown" && section !== "unknown") t.section = section;
-        return t;
-      };
-      const record = (t: TopicStat, src: string, graded: boolean, correct: boolean) => {
-        t.attempted++;
-        if (graded) {
-          t.graded++;
-          if (correct) t.correct++;
-        }
-        if (!t.sources.includes(src)) t.sources.push(src);
-      };
-      const recordSection = (s: string, graded: boolean, correct: boolean) => {
-        const b = (sections[s] ??= { attempted: 0, graded: 0, correct: 0, accuracy: null });
-        b.attempted++;
-        if (graded) {
-          b.graded++;
-          if (correct) b.correct++;
-        }
-      };
-
-      const authErr = await client.auth.getToken().then(() => null, (e) => toToolError(e));
-      let quizSummary: unknown = null;
-      let sectional: unknown = undefined;
-      if (authErr) errors.push(authErr);
-      else {
-        const [qs, quizzes] = await Promise.all([fetchQuestions(client, 3000), fetchQuizzes(client, {})]);
-        if (!qs.ok) errors.push(qs.error);
-        else {
-          for (const q of qs.data.questions) {
-            const o = questionOutcome(q);
-            const tagList = q.tags.length ? q.tags : ["(untagged)"];
-            for (const tag of tagList) {
-              const t = topicFor(tag, q.section);
-              t.available++;
-              if (o.attempted) record(t, "gregmat", o.graded, o.correct);
-            }
-            if (o.attempted) {
-              recordSection(q.section, o.graded, o.correct);
-              if (o.proxy) proxyUsed = true;
-            }
-          }
-        }
-        if (!quizzes.ok) errors.push(quizzes.error);
-        else {
-          const bySec: Record<string, number[]> = {};
-          for (const z of quizzes.data.quizzes) if (z.percent !== null) (bySec[z.section] ??= []).push(z.percent);
-          quizSummary = Object.fromEntries(
-            Object.entries(bySec).map(([s, arr]) => [s, { quizzes: arr.length, average_percent: Math.round((arr.reduce((a, b) => a + b, 0) / arr.length) * 10) / 10 }]),
-          );
-        }
-        if (include_sectional_tests) {
-          try {
-            const token = await client.auth.getToken();
-            sectional = await scrapeSectionalTests(token);
-          } catch (e) {
-            sectional = { error: (e as Error).message, ...(e instanceof ScraperUnavailableError ? { hint: "optional dependency" } : { hint: `${CONFIG_HINT} (PAGES/SELECTORS)` }) };
-          }
-        }
-      }
-      for (const e of log.entries) {
-        const graded = e.correct !== undefined;
-        record(topicFor(e.topic, e.section), "local_log", graded, !!e.correct);
-        recordSection(e.section, graded, !!e.correct);
-      }
-
-      const all = [...topics.values()].map((t) => ({ ...t, accuracy: pct(t.correct, t.graded) }));
-      for (const s of Object.values(sections)) s.accuracy = pct(s.correct, s.graded);
-      const ranked = all.filter((t) => t.graded >= minA).sort((a, b) => (a.accuracy ?? 0) - (b.accuracy ?? 0) || b.graded - a.graded);
-      const attemptedNames = all.filter((t) => t.attempted > 0).map((t) => t.topic.toLowerCase());
-      const unattemptedHighYield = (["quant", "verbal"] as const).flatMap((sec) =>
-        HIGH_YIELD_TOPICS[sec]
-          .filter((h) => {
-            const words = h.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 3);
-            return !attemptedNames.some((a) => a.includes(h.toLowerCase()) || words.some((w) => a.includes(w)));
-          })
-          .map((h) => ({ topic: h, section: sec })),
-      );
-      const unattemptedGregmatTags = all
-        .filter((t) => t.attempted === 0 && t.available >= 5)
-        .sort((a, b) => b.available - a.available)
-        .slice(0, 15)
-        .map((t) => ({ topic: t.topic, section: t.section, questions_available: t.available }));
-
-      return jsonResult({
+      const out: Json = {
         derived: true,
         method:
-          "Derived, not an official GregMAT diagnostic. Accuracy = correct / graded attempts per tag, from /ps/questions/ per-user status plus local-log entries with `correct`." +
-          (proxyUsed ? " Where GregMAT exposes only solved/attempted (no correctness), 'solved' counts as correct and 'attempted but not solved' as incorrect (proxy)." : ""),
+          "Derived, not an official GregMAT diagnostic. Accuracy = first-attempt correctness (user_answer_attempts[first=true]) per question, grouped by first_tlc category, question type and topic tag, as on the site. Groups with fewer than min_attempts first attempts are listed separately.",
         ...testInfo(),
-        sections,
-        weakest_topics: ranked.slice(0, n),
-        strongest_topics: ranked.slice(-n).reverse(),
-        topics_ranked_count: ranked.length,
-        topics_below_min_attempts: all.filter((t) => t.attempted > 0 && t.graded < minA).map((t) => ({ topic: t.topic, graded: t.graded })),
-        unattempted_high_yield: unattemptedHighYield,
-        unattempted_gregmat_tags: unattemptedGregmatTags,
-        quiz_average_by_section: quizSummary,
-        ...(sectional !== undefined ? { sectional_tests_scrape: sectional } : {}),
-        ...(errors.length ? { errors } : {}),
-        ...(log.error ? { local_log_error: log.error } : {}),
-      });
+        min_attempts: minA,
+      };
+
+      const authErr = await authError(client);
+      if (authErr) errors.push(authErr);
+      else {
+        const [qs, quizzes, sb, counts] = await Promise.all([fetchQuestions(client, { refresh }), fetchQuizzes(client), fetchSkillStats(client), fetchTagCounts(client)]);
+        for (const f of [qs, quizzes, sb]) if (!f.ok) errors.push(f.error);
+        const warnings: string[] = [];
+        if (qs.ok) {
+          const questions = qs.data.questions;
+          const ranked = (stats: GroupStat[]) => weakestFirst(stats.filter((g) => g.first_attempts >= minA));
+          const thin = (stats: GroupStat[]) => stats.filter((g) => g.first_attempts > 0 && g.first_attempts < minA).map((g) => ({ name: g.name, first_attempts: g.first_attempts, accuracy: g.accuracy }));
+          const topics = byTopic(questions);
+          const rankedTopics = ranked(topics);
+          out.sections = bySection(questions).map((g) => ({ name: g.name, attempted: g.attempted, solved: g.solved, first_attempts: g.first_attempts, accuracy: g.accuracy }));
+          out.by_category = ranked(byCategory(questions));
+          out.by_type = ranked(byType(questions));
+          out.by_topic = rankedTopics;
+          out.weakest_topics = rankedTopics.slice(0, n);
+          out.strongest_topics = rankedTopics.length > n ? rankedTopics.slice(-n).reverse() : [];
+          out.below_min_attempts = { categories: thin(byCategory(questions)), types: thin(byType(questions)), topics: thin(topics) };
+          if (!counts.ok) warnings.push(`question-counts unavailable: ${counts.error.error}`);
+          out.untouched_topics = untouchedTopics(questions, counts.ok ? counts.data : {}).slice(0, 25);
+          if (qs.data.warnings.length) warnings.push(...qs.data.warnings);
+          out.cached = qs.data.from_cache;
+        }
+        if (quizzes.ok) out.quiz_average_by_section = summarizeQuizzes(quizzes.data.quizzes);
+        if (sb.ok) out.skill_building_first_attempt_accuracy = sb.data.map((s) => ({ kind: s.kind, first_attempts: s.total_first_attempts, accuracy: s.first_attempt_accuracy }));
+        if (warnings.length) out.warnings = warnings;
+      }
+      // Local-log accuracy stays separate (never double-counted with GregMAT).
+      out.local_log = aggregate(filterEntries(log.entries));
+      if (errors.length) out.errors = errors;
+      if (log.error) out.local_log_error = log.error;
+      return jsonResult(out);
     }),
   );
 
@@ -492,37 +477,40 @@ export function registerTools(server: McpServer, client: GregmatClient): void {
     {
       title: "Study plan progress",
       description:
-        "GregMAT study plan progress (/studyplans/{slug}/): units done/total, next undone units, and the per-day pace needed to finish by the test date.",
+        "GregMAT study plan progress: gathers all modules of the parent plan (/studyplans/), counts units done, lists next undone units (title + first lines of their content) and the per-day pace needed by the test date. If the default plan has no progress, reports which plan is in use (or that none is).",
       inputSchema: {
-        slug: z.string().optional().describe("Study plan slug (default GREGMAT_STUDY_PLAN or the-im-overwhelmed-study-plan)"),
+        slug: z.string().optional().describe("Parent plan slug (default GREGMAT_STUDY_PLAN or the-im-overwhelmed-study-plan)"),
         next_n: z.number().int().min(1).max(100).optional().describe("How many upcoming undone units to list (default 10)"),
       },
     },
     safe(async ({ slug, next_n }: { slug?: string; next_n?: number }) => {
-      const s = slug ?? defaultStudyPlan();
-      const r = await fetchStudyPlan(client, s);
       const ti = testInfo();
+      const authErr = await authError(client);
+      if (authErr) return jsonResult({ ...authErr, ...ti }, true);
+      const r = await planProgress(client, slug);
       if (!r.ok) return jsonResult({ ...r.error, ...ti }, true);
-      const units = r.data.plan.units;
-      const done = units.filter((u) => u.done === true).length;
-      const remaining = units.filter((u) => u.done !== true);
+      const p = r.data;
       const days = Math.max(ti.days_until_test, 0);
-      const doneDates = units.filter((u) => u.done && u.date).map((u) => localDay(u.date!));
+      const doneDates = p.doneUnits.filter((u) => u.date).map((u) => localDay(u.date!));
       return jsonResult({
-        slug: s,
-        title: r.data.plan.title,
-        done,
-        total: units.length,
-        percent: pct(done, units.length),
-        remaining: remaining.length,
+        slug: p.slug,
+        title: p.title,
+        plan_in_use: p.planInUse,
+        done: p.done,
+        total: p.total,
+        percent: p.percent,
+        remaining: p.remainingUnits.length,
+        modules: p.modules,
         ...ti,
         pacing: {
-          units_per_day_needed: days > 0 ? Math.round((remaining.length / days) * 10) / 10 : remaining.length,
-          note: days > 0 ? `${remaining.length} units over ${days} days` : "Test date reached or passed",
+          units_per_day_needed: days > 0 ? round1(p.remainingUnits.length / days) : p.remainingUnits.length,
+          note: days > 0 ? `${p.remainingUnits.length} units over ${days} days` : "Test date reached or passed",
           last_unit_done_on: doneDates.sort().pop() ?? null,
         },
-        next_units: remaining.slice(0, next_n ?? 10),
-        ...(r.data.plan.shape_note ? { note: r.data.plan.shape_note, raw_shape: r.data.raw_shape, hint: CONFIG_HINT } : {}),
+        next_units: p.remainingUnits.slice(0, next_n ?? 10).map((u) => ({ module: u.module_title, module_index: u.module_index, id: u.id, title: u.title, plus_only: u.plus_only, preview: u.preview })),
+        ...(p.note ? { note: p.note } : {}),
+        ...(p.otherPlansWithProgress.length ? { other_plans_with_progress: p.otherPlansWithProgress } : {}),
+        ...(p.warnings.length ? { warnings: p.warnings } : {}),
       });
     }),
   );

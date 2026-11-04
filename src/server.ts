@@ -10,8 +10,8 @@ export function createServer(client: GregmatClient = new GregmatClient()): McpSe
     {
       instructions:
         "Read-only access to the user's GregMAT (gregmat.com) GRE prep progress plus a local study log. " +
-        "GregMAT response shapes are partly guessed: if a tool returns {error, endpoint, hint}, use raw_get to inspect the endpoint. " +
-        "Diagnostics are derived from per-question results, not an official GregMAT diagnostic.",
+        "If a tool returns {error, endpoint, hint}, use raw_get to inspect the endpoint. " +
+        "Accuracy figures are first-attempt accuracy derived from per-question attempts, not an official GregMAT diagnostic.",
     },
   );
   registerTools(server, client);

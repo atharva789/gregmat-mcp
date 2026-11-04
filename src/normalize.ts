@@ -1,7 +1,6 @@
 /**
- * Defensive mappers from unknown GregMAT JSON to normalized types.
- * Response shapes are GUESSES — anything we can't map is passed through as `raw`
- * (or summarized) so the assistant can still read it.
+ * Mappers from GregMAT JSON (shapes verified in docs/API-FINDINGS.md) to normalized types.
+ * Unknown quiz-attempt shapes are mapped defensively and returned with their `raw` object.
  */
 import { AWA_KEYWORDS, QUANT_KEYWORDS, VERBAL_KEYWORDS } from "./config.js";
 
@@ -112,255 +111,304 @@ export function normalizeSection(v: unknown): Section {
 }
 
 // ---------------------------------------------------------------------------
-// Profile
+// Profile (/authentication/me/ → {user:{email, first_name, is_plus, ...}})
 // ---------------------------------------------------------------------------
 export interface Profile {
   id: string | null;
   name: string | null;
   email: string | null;
-  username: string | null;
-  subscription: unknown;
-  is_subscribed: boolean | null;
-  date_joined: string | null;
-  other_fields: string[];
+  is_plus: boolean | null;
+  subscription_status: string | null;
+  current_period_end: string | null;
+  subscriptions: unknown;
+  per_site_access: unknown;
 }
 
 export function normalizeProfile(raw: unknown): Profile {
-  const u = isObj(raw) && isObj(raw.user) ? { ...raw, ...raw.user } : raw;
+  const u = isObj(raw) && isObj(raw.user) ? raw.user : raw;
   const first = pickStr(u, ["first_name", "firstName"]);
   const last = pickStr(u, ["last_name", "lastName"]);
-  const name = pickStr(u, ["name", "full_name", "fullName", "display_name"]) ?? ([first, last].filter(Boolean).join(" ") || null);
-  const subscription =
-    pick(u, ["subscription", "subscriptions", "active_subscription", "tier", "plan", "membership", "subscription_tier"]) ?? null;
-  const known = new Set([
-    "id", "pk", "uuid", "name", "full_name", "first_name", "last_name", "email", "username", "subscription",
-    "subscriptions", "active_subscription", "tier", "plan", "is_subscribed", "isSubscribed", "date_joined", "user",
-  ]);
   return {
     id: pickStr(u, ["id", "pk", "uuid", "user_id"]),
-    name,
+    name: pickStr(u, ["name", "full_name"]) ?? ([first, last].filter(Boolean).join(" ") || null),
     email: pickStr(u, ["email"]),
-    username: pickStr(u, ["username"]),
-    subscription: summarizeSubscription(subscription),
-    is_subscribed: pickBool(u, ["is_subscribed", "isSubscribed", "is_premium", "premium", "has_subscription", "is_member"]),
-    date_joined: pickDate(u, ["date_joined", "dateJoined", "created_at", "joined"]),
-    other_fields: isObj(u) ? Object.keys(u).filter((k) => !known.has(k)) : [],
+    is_plus: pickBool(u, ["is_plus", "is_subscribed", "isSubscribed"]),
+    subscription_status: pickStr(u, ["stripe_subscription_status", "subscription_status"]),
+    current_period_end: pickDate(u, ["current_period_end"]),
+    subscriptions: pick(u, ["subscriptions", "subscription"]) ?? null,
+    per_site_access: pick(u, ["per_site_access"]) ?? null,
   };
 }
 
-function summarizeSubscription(s: unknown): unknown {
-  if (Array.isArray(s)) return s.map(summarizeSubscription);
-  if (isObj(s)) {
-    const out: Obj = {};
-    for (const k of ["name", "tier", "slug", "status", "active", "is_active", "expires", "expires_at", "end_date", "current_period_end"]) {
-      if (s[k] !== undefined) out[k] = isObj(s[k]) ? pickStr(s[k], ["name", "slug"]) : s[k];
-    }
-    return Object.keys(out).length ? out : s;
-  }
-  return s;
+// ---------------------------------------------------------------------------
+// Problem-solving questions (/ps/questions/)
+// ---------------------------------------------------------------------------
+export type QuestionStatus = "solved" | "attempted" | "todo" | "unknown";
+
+export interface Attempt {
+  answered_at: string | null;
+  correct: boolean | null;
+  first: boolean;
+  score: number | null;
+  score_denom: number | null;
 }
 
-// ---------------------------------------------------------------------------
-// Problem-solving questions
-// ---------------------------------------------------------------------------
-export type QuestionStatus = "solved" | "attempted" | "unattempted" | "unknown";
+export interface QuestionTag {
+  id: string | null;
+  slug: string | null;
+  title: string;
+  type: string | null;
+}
 
 export interface Question {
   id: string | null;
   slug: string | null;
   title: string | null;
-  section: Section;
-  tags: string[];
+  type: string | null;
   difficulty: string | null;
+  super_category: string | null;
+  section: Section;
   status: QuestionStatus;
-  correct: boolean | null;
-  date: string | null;
+  /** Top-level category (first_tlc), e.g. Arithmetic, Algebra, Text Completion. */
+  category: string | null;
+  tags: QuestionTag[];
+  attempts: Attempt[];
+  /** Correctness of the first attempt (site's accuracy convention); null when not attempted. */
+  first_attempt_correct: boolean | null;
+  last_attempt_at: string | null;
+  bookmarked: boolean;
 }
 
-export function extractTags(o: unknown): string[] {
-  const v = pick(o, ["tags", "question_tags", "topics", "topic", "tag", "categories", "category"]);
-  const arr = Array.isArray(v) ? v : v !== undefined ? [v] : [];
-  const out: string[] = [];
-  for (const t of arr) {
-    if (typeof t === "string") out.push(t);
-    else if (isObj(t)) {
-      const s = pickStr(t, ["name", "title", "label", "slug", "tag"]);
-      if (s) out.push(s);
-    }
-  }
-  return [...new Set(out)];
+export function normalizeAttempt(raw: unknown): Attempt {
+  return {
+    answered_at: pickDate(raw, ["answered_at", "created_at"]),
+    correct: pickBool(raw, ["correct"]),
+    first: pickBool(raw, ["first"]) === true,
+    score: pickNum(raw, ["score"]),
+    score_denom: pickNum(raw, ["score_denom"]),
+  };
 }
 
 export function normalizeQuestion(raw: unknown): Question {
-  const status = pick(raw, ["user_status", "status", "progress", "user_progress", "solve_status", "state"]);
-  const statusObj = isObj(status) ? status : null;
-  const statusStr = typeof status === "string" ? status.toLowerCase() : null;
+  const st = (pickStr(raw, ["status"]) ?? "").toLowerCase();
+  const attemptsRaw = pick(raw, ["user_answer_attempts"]);
+  const attempts = (Array.isArray(attemptsRaw) ? attemptsRaw : []).filter(isObj).map(normalizeAttempt);
+  attempts.sort((a, b) => (a.answered_at ?? "").localeCompare(b.answered_at ?? ""));
+  const firstAttempt = attempts.find((a) => a.first) ?? null;
 
-  let correct = pickBool(raw, ["correct", "is_correct", "isCorrect", "solved_correctly", "user_correct", "was_correct"]);
-  if (correct === null && statusObj) correct = pickBool(statusObj, ["correct", "is_correct", "isCorrect"]);
-  if (correct === null && statusStr) {
-    if (/^(correct|right)$/.test(statusStr)) correct = true;
-    else if (/^(incorrect|wrong)$/.test(statusStr)) correct = false;
-  }
+  let status: QuestionStatus = "unknown";
+  if (st === "solved") status = "solved";
+  else if (st === "attempted") status = "attempted";
+  else if (st === "todo" || st === "") status = st === "todo" ? "todo" : attempts.length ? "attempted" : "unknown";
+  if (status === "todo" && attempts.length) status = "attempted";
 
-  const solvedFlag =
-    pickBool(raw, ["solved", "is_solved", "isSolved", "done", "is_done", "completed", "user_solved"]) ??
-    (statusObj ? pickBool(statusObj, ["solved", "done", "completed"]) : null);
-  const attemptedFlag =
-    pickBool(raw, ["attempted", "is_attempted", "isAttempted", "user_attempted", "seen"]) ??
-    (statusObj ? pickBool(statusObj, ["attempted"]) : null);
-  const attempts = pickNum(raw, ["attempts", "attempt_count", "num_attempts", "user_attempts"]);
+  const tagsRaw = pick(raw, ["tags"]);
+  const tags: QuestionTag[] = (Array.isArray(tagsRaw) ? tagsRaw : []).filter(isObj).map((t) => ({
+    id: pickStr(t, ["id"]),
+    slug: pickStr(t, ["slug"]),
+    title: pickStr(t, ["title", "name", "slug"]) ?? "(untitled)",
+    type: pickStr(t, ["type"]),
+  }));
 
-  let qs: QuestionStatus = "unknown";
-  if (solvedFlag === true || (statusStr && /solved|done|complete|correct/.test(statusStr) && !/un|not|incorrect/.test(statusStr))) qs = "solved";
-  else if (attemptedFlag === true || correct !== null || (attempts !== null && attempts > 0) || (statusStr && /attempt|incorrect|wrong/.test(statusStr))) qs = "attempted";
-  else if (solvedFlag === false || attemptedFlag === false || (statusStr && /unsolved|not|new|todo|unattempted/.test(statusStr)) || attempts === 0) qs = "unattempted";
-
-  const tags = extractTags(raw);
-  const title = pickStr(raw, ["title", "name", "question_title", "short_text"]);
-  const slug = pickStr(raw, ["slug"]);
-  const explicitSection = normalizeSection(pick(raw, ["section", "subject", "type", "question_type", "category"]));
-  const section = explicitSection !== "unknown" ? explicitSection : classifySection(tags.join(" "), title, slug);
-
+  const superCat = pickStr(raw, ["super_category"]);
   return {
-    id: pickStr(raw, ["id", "pk", "uuid"]),
-    slug,
-    title,
-    section,
+    id: pickStr(raw, ["id"]),
+    slug: pickStr(raw, ["slug"]),
+    title: pickStr(raw, ["title"]),
+    type: pickStr(raw, ["type"]),
+    difficulty: pickStr(raw, ["difficulty"]),
+    super_category: superCat,
+    section: normalizeSection(superCat),
+    status,
+    category: pickStr(raw, ["first_tlc"]),
     tags,
-    difficulty: pickStr(raw, ["difficulty", "level", "difficulty_level"]),
-    status: qs,
-    correct,
-    date: pickDate(raw) ?? (statusObj ? pickDate(statusObj) : null),
+    attempts,
+    first_attempt_correct: firstAttempt ? firstAttempt.correct : null,
+    last_attempt_at: attempts.length ? attempts[attempts.length - 1].answered_at : null,
+    bookmarked: pickBool(raw, ["bookmarked"]) === true,
   };
 }
 
+/** Topic tags (type "topic") of a question. */
+export function topicTags(q: Question): QuestionTag[] {
+  return q.tags.filter((t) => (t.type ?? "topic") === "topic");
+}
+
 // ---------------------------------------------------------------------------
-// Quizzes
+// Quizzes (/ps/quizgroup/{slug}/, /ps/quizsupergroup/{slug}/)
 // ---------------------------------------------------------------------------
-export interface QuizResult {
-  slug: string | null;
-  title: string | null;
-  section: Section;
-  attempts: number | null;
+export interface QuizAttempt {
   score: number | null;
   max_score: number | null;
   percent: number | null;
-  completed: boolean | null;
   date: string | null;
+  /** The element as returned (shape was unknown when written), for transparency. */
+  raw: unknown;
 }
 
-export function normalizeQuiz(raw: unknown): QuizResult {
-  const userBlock = pick(raw, ["user_result", "result", "user_attempt", "last_attempt", "best_attempt", "user_progress", "progress"]);
-  const src = isObj(userBlock) ? { ...(raw as Obj), ...userBlock } : raw;
-  const score = pickNum(src, ["score", "correct", "num_correct", "correct_count", "user_score", "best_score"]);
-  const max = pickNum(src, ["max_score", "total", "num_questions", "question_count", "questions_count", "out_of", "total_questions"]);
-  let percent = pickNum(src, ["percent", "percentage", "accuracy", "score_percent"]);
-  if (percent === null && score !== null && max) percent = Math.round((score / max) * 1000) / 10;
-  const attemptsArr = pick(raw, ["attempts", "user_attempts"]);
-  const attempts = Array.isArray(attemptsArr) ? attemptsArr.length : pickNum(raw, ["attempts", "attempt_count", "num_attempts", "times_taken"]);
-  const title = pickStr(raw, ["title", "name"]);
-  const slug = pickStr(raw, ["slug"]);
-  return {
-    slug,
-    title,
-    section: normalizeSection(pick(raw, ["section", "subject"])) !== "unknown"
-      ? normalizeSection(pick(raw, ["section", "subject"]))
-      : classifySection(title, slug, extractTags(raw).join(" ")),
-    attempts,
-    score,
-    max_score: max,
-    percent,
-    completed: pickBool(src, ["completed", "done", "is_completed", "finished", "solved"]) ?? (score !== null ? true : null),
-    date: pickDate(src),
-  };
-}
-
-/** Pull quiz-like objects out of a group / supergroup / collection response. */
-export function findQuizzes(raw: unknown, depth = 0): unknown[] {
-  if (depth > 4) return [];
-  if (Array.isArray(raw)) {
-    const quizLike = raw.filter((x) => isObj(x) && (x.slug !== undefined || x.title !== undefined || x.name !== undefined));
-    const nested = raw.flatMap((x) => (isObj(x) ? findQuizzesIn(x, depth + 1) : []));
-    return nested.length ? nested : quizLike;
-  }
-  if (isObj(raw)) {
-    const nested = findQuizzesIn(raw, depth + 1);
-    return nested.length ? nested : [];
-  }
-  return [];
-}
-function findQuizzesIn(o: Obj, depth: number): unknown[] {
-  for (const k of ["quizzes", "quiz_set", "quizes", "results", "items"]) {
-    if (Array.isArray(o[k])) {
-      const inner = findQuizzes(o[k], depth);
-      return inner.length ? inner : (o[k] as unknown[]);
-    }
-  }
-  for (const k of ["groups", "quiz_groups", "quizgroups", "children", "sections"]) {
-    if (Array.isArray(o[k])) return (o[k] as unknown[]).flatMap((g) => (isObj(g) ? findQuizzesIn(g, depth + 1) : []));
-  }
-  return [];
-}
-
-// ---------------------------------------------------------------------------
-// Study plan
-// ---------------------------------------------------------------------------
-export interface StudyPlanUnit {
+export interface Quiz {
   id: string | null;
-  title: string | null;
-  done: boolean | null;
-  day: string | null;
-  section: Section;
-  url: string | null;
-  date: string | null;
-}
-export interface StudyPlan {
   slug: string | null;
   title: string | null;
-  units: StudyPlanUnit[];
-  shape_note?: string;
+  group: string | null;
+  source: string;
+  section: Section;
+  minutes: number | null;
+  max_score: number | null;
+  mean_score: number | null;
+  acceptance: number | null;
+  plus_only: boolean;
+  attempts: QuizAttempt[];
 }
 
-const DONE_KEYS = ["done", "is_done", "isDone", "completed", "is_completed", "user_done", "checked", "finished"];
+const ATTEMPT_SCORE_KEYS = ["score", "raw_score", "total_score", "correct", "num_correct", "correct_count"];
+const ATTEMPT_MAX_KEYS = ["score_denom", "max_score", "total", "num_questions", "total_questions", "out_of"];
+const ATTEMPT_DATE_KEYS = ["finished_at", "completed_at", "answered_at", "submitted_at", "ended_at", "created_at", "started_at", "date"];
 
-/** Recursively collect objects that carry a done-like flag; tracks the nearest "day"/"week" label. */
-function collectUnits(raw: unknown, ctx: string | null, out: StudyPlanUnit[], depth: number): void {
-  if (depth > 6) return;
-  if (Array.isArray(raw)) {
-    raw.forEach((x) => collectUnits(x, ctx, out, depth + 1));
-    return;
-  }
-  if (!isObj(raw)) return;
-  const hasDone = DONE_KEYS.some((k) => k in raw) || isObj(raw.user_status);
-  const label = pickStr(raw, ["day", "day_number", "week", "label"]) ?? null;
-  const childCtx = label ? (ctx ? `${ctx} / ${label}` : label) : ctx;
-  const childArrays = Object.entries(raw).filter(([, v]) => Array.isArray(v) && (v as unknown[]).some(isObj));
-  if (hasDone) {
-    const title = pickStr(raw, ["title", "name", "text", "description", "content.title"]);
-    out.push({
-      id: pickStr(raw, ["id", "pk", "uuid"]),
-      title,
-      done: pickBool(raw, DONE_KEYS) ?? (isObj(raw.user_status) ? pickBool(raw.user_status, DONE_KEYS) : null),
-      day: pickStr(raw, ["day", "day_number", "week"]) ?? ctx,
-      section: classifySection(pickStr(raw, ["section", "subject", "type"]), title),
-      url: pickStr(raw, ["url", "link", "href", "content.url"]),
-      date: pickDate(raw, ["done_at", "doneAt", "completed_at", "updated_at", "date"]),
-    });
-    if (childArrays.length === 0) return;
-  }
-  for (const [, v] of childArrays) collectUnits(v, childCtx, out, depth + 1);
+/** Element shape of quiz `attempts` was unknown (empty in the probe): map defensively. */
+export function normalizeQuizAttempt(raw: unknown, quizMax: number | null): QuizAttempt {
+  const score = pickNum(raw, ATTEMPT_SCORE_KEYS);
+  const max = pickNum(raw, ATTEMPT_MAX_KEYS) ?? quizMax;
+  let percent = pickNum(raw, ["percent", "percentage", "accuracy"]);
+  if (percent === null && score !== null && max) percent = Math.round((score / max) * 1000) / 10;
+  return { score, max_score: max, percent, date: pickDate(raw, ATTEMPT_DATE_KEYS), raw };
 }
 
-export function normalizeStudyPlan(raw: unknown, slug?: string): StudyPlan {
-  const units: StudyPlanUnit[] = [];
-  collectUnits(raw, null, units, 0);
+export function normalizeQuiz(raw: unknown, ctx: { source: string; group?: string | null; section?: Section }): Quiz {
+  const max = pickNum(raw, ["max_score"]);
+  const attemptsRaw = pick(raw, ["attempts"]);
+  const title = pickStr(raw, ["title"]);
+  const sc = pickStr(raw, ["super_category"]);
+  let section = sc ? normalizeSection(sc) : "unknown";
+  if (section === "unknown") section = ctx.section ?? classifySection(title);
   return {
-    slug: pickStr(raw, ["slug"]) ?? slug ?? null,
-    title: pickStr(raw, ["title", "name"]),
-    units,
-    shape_note: units.length === 0 ? "No objects with a done-like flag found; see `raw_shape` and update normalize.ts/config.ts" : undefined,
+    id: pickStr(raw, ["id"]),
+    slug: pickStr(raw, ["slug"]),
+    title,
+    group: ctx.group ?? null,
+    source: ctx.source,
+    section,
+    minutes: pickNum(raw, ["minutes"]),
+    max_score: max,
+    mean_score: pickNum(raw, ["mean_score"]),
+    acceptance: pickNum(raw, ["acceptance"]),
+    plus_only: pickBool(raw, ["plus_only"]) === true,
+    attempts: (Array.isArray(attemptsRaw) ? attemptsRaw : []).map((a) => normalizeQuizAttempt(a, max)),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Study plans (/studyplans/, /studyplans/{slug}/)
+// ---------------------------------------------------------------------------
+export interface PlanSummary {
+  slug: string;
+  title: string | null;
+  role: "plan" | "module" | "unknown";
+  parentSlug: string | null;
+  moduleIndex: number | null;
+  plusOnly: boolean;
+}
+
+export function normalizePlanSummary(raw: unknown): PlanSummary | null {
+  const slug = pickStr(raw, ["slug"]);
+  if (!slug) return null;
+  const flags = isObj(raw) && isObj(raw.flags) ? raw.flags : {};
+  const role = flags.planRole === "plan" || flags.planRole === "module" ? flags.planRole : "unknown";
+  return {
+    slug,
+    title: pickStr(raw, ["title"]),
+    role,
+    parentSlug: pickStr(flags, ["parentSlug"]),
+    moduleIndex: pickNum(flags, ["moduleIndex"]),
+    plusOnly: pickBool(raw, ["plus_only"]) === true,
+  };
+}
+
+export interface StudyUnit {
+  id: string | null;
+  title: string | null;
+  done: boolean;
+  plus_only: boolean;
+  module_slug: string;
+  module_title: string | null;
+  module_index: number | null;
+  /** First lines of the left-hand side (links/text), HTML stripped. */
+  preview: string;
+  date: string | null;
+}
+
+export interface StudyModule {
+  slug: string;
+  title: string | null;
+  index: number | null;
+  units: StudyUnit[];
+}
+
+/** Strip tags/entities from an HTML snippet; keep link text and line breaks. */
+export function stripHtml(html: unknown, maxLines = 4, maxChars = 400): string {
+  if (typeof html !== "string") return "";
+  const text = html
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")
+    .replace(/<\s*(br|\/p|\/li|\/div|\/h\d|\/tr)\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'");
+  const lines = text.split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
+  return lines.slice(0, maxLines).join("\n").slice(0, maxChars);
+}
+
+export function normalizeStudyModule(raw: unknown, fallback: { slug: string; index?: number | null }): StudyModule {
+  const slug = pickStr(raw, ["slug"]) ?? fallback.slug;
+  const title = pickStr(raw, ["title"]);
+  const flags = isObj(raw) && isObj(raw.flags) ? raw.flags : {};
+  const index = pickNum(flags, ["moduleIndex"]) ?? fallback.index ?? null;
+  const unitsRaw = isObj(raw) && Array.isArray(raw.units) ? raw.units : [];
+  const units = unitsRaw.filter(isObj).map((u) => ({
+    id: pickStr(u, ["id"]),
+    title: pickStr(u, ["title"]),
+    done: u.done === true,
+    plus_only: pickBool(u, ["plus_only"]) === true,
+    module_slug: slug,
+    module_title: title,
+    module_index: index,
+    preview: stripHtml(u.left_side) || stripHtml(u.description),
+    date: pickDate(u, ["done_at", "completed_at"]),
+  }));
+  return { slug, title, index, units };
+}
+
+// ---------------------------------------------------------------------------
+// Skill-building stats (/sb/stats/me/)
+// ---------------------------------------------------------------------------
+export interface SkillStat {
+  kind: string;
+  total_questions: number | null;
+  total_attempts: number | null;
+  total_first_attempts: number | null;
+  total_correct_first_attempts: number | null;
+  first_attempt_accuracy: number | null;
+}
+
+export function normalizeSbStats(raw: unknown): SkillStat[] {
+  if (!isObj(raw)) return [];
+  return Object.entries(raw)
+    .filter(([, v]) => isObj(v))
+    .map(([kind, v]) => {
+      const fa = pickNum(v, ["total_first_attempts"]);
+      const ca = pickNum(v, ["total_correct_first_attempts"]);
+      return {
+        kind,
+        total_questions: pickNum(v, ["total_questions"]),
+        total_attempts: pickNum(v, ["total_attempts"]),
+        total_first_attempts: fa,
+        total_correct_first_attempts: ca,
+        first_attempt_accuracy: fa ? Math.round(((ca ?? 0) / fa) * 1000) / 10 : null,
+      };
+    });
 }
 
 // ---------------------------------------------------------------------------

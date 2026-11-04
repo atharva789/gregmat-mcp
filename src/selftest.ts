@@ -2,7 +2,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { GregmatClient, endpointPath } from "./api.js";
-import { API_BASE, AUTH, ENDPOINTS, EndpointDef, EndpointKey, defaultStudyPlan, env, homeDir, testDate } from "./config.js";
+import { API_BASE, ENDPOINTS, EndpointDef, EndpointKey, defaultStudyPlan, env, homeDir, testDate } from "./config.js";
+import { LOGIN_HELP } from "./auth.js";
 import { ApiError, AuthError } from "./errors.js";
 import { findArray, isObj } from "./normalize.js";
 import { createServer } from "./server.js";
@@ -39,16 +40,11 @@ export async function runSelfTest(): Promise<number> {
   } catch (e) {
     out(`  FAILED: ${(e as Error).message}`);
     if (e instanceof AuthError) for (const a of e.attempts) out(`    - ${a}`);
-    out("  Fix: set GREGMAT_TOKEN (value of the piniaAccess cookie on gregmat.com), GREGMAT_COOKIE, or GREGMAT_EMAIL/GREGMAT_PASSWORD.");
-    out(`  If login body is wrong: NEEDS UPDATE: src/config.ts AUTH.loginBodyVariants`);
+    out(`  Fix: ${LOGIN_HELP}`);
     return 1;
   }
   const info = client.auth.info;
-  out(`  OK via ${info.source}${info.loginVariant ? ` (login body variant "${info.loginVariant}")` : ""}`);
-  if (info.source === "login") {
-    const v = AUTH.loginBodyVariants.find((x) => x.name === info.loginVariant);
-    if (v && !v.verified) out(`  NOTE: mark loginBodyVariants "${v.name}" as verified: true in src/config.ts`);
-  }
+  out(`  OK via ${info.source}`);
   if (info.tokenExpiresAt) out(`  token expires: ${info.tokenExpiresAt}`);
   for (const a of info.attempts) out(`    - ${a}`);
   try {
@@ -62,10 +58,6 @@ export async function runSelfTest(): Promise<number> {
   out("== Endpoints ==");
   const needsUpdate: string[] = [];
   for (const [key, def] of Object.entries(ENDPOINTS) as [EndpointKey, EndpointDef][]) {
-    if (def.skipSelfTest) {
-      out(`  [skip] ${key.padEnd(18)} ${def.path} (needs a slug/id; try raw_get)`);
-      continue;
-    }
     let p: string;
     try {
       p = endpointPath(key, def.sampleParams);
@@ -74,7 +66,7 @@ export async function runSelfTest(): Promise<number> {
       continue;
     }
     try {
-      const r = await client.get(p, def.query);
+      const r = await client.get(p, { ...(def.query ?? {}), ...(def.selfTestQuery ?? {}) });
       const d = r.data;
       const keys = isObj(d) ? Object.keys(d).slice(0, 15).join(", ") : Array.isArray(d) ? `(array)` : typeof d;
       const count = isObj(d) && typeof d.count === "number" ? `count=${d.count}, ` : "";

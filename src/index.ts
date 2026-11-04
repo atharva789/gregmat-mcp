@@ -8,19 +8,26 @@ const HELP = `gregmat-mcp ${VERSION} — read-only MCP server for your GregMAT G
 
 Usage:
   gregmat-mcp              Start the MCP server on stdio (what MCP clients run)
+  gregmat-mcp --login      Open a browser, sign in to GregMAT by hand (Google/Apple/email), cache the session
   gregmat-mcp --self-test  Authenticate, probe endpoints, print a progress summary
   gregmat-mcp --help       Show this help
   gregmat-mcp --version    Print version
 
+Auth (first that works): GREGMAT_TOKEN / GREGMAT_COOKIE -> cached session (~/.gregmat-mcp/session.json,
+refreshed automatically) -> browser login with GREGMAT_EMAIL + GREGMAT_PASSWORD. GregMAT's login needs a
+reCAPTCHA, so login always happens in a real browser window; it needs a display (headless Linux: xvfb-run).
+
 Environment:
   GREGMAT_TOKEN       Access JWT (value of the piniaAccess cookie on gregmat.com)
   GREGMAT_COOKIE      Cookie header string from gregmat.com (piniaAccess is extracted)
-  GREGMAT_EMAIL       Email for password login (with GREGMAT_PASSWORD)
-  GREGMAT_PASSWORD    Password for password login
+  GREGMAT_EMAIL       Email for automatic browser login (with GREGMAT_PASSWORD)
+  GREGMAT_PASSWORD    Password for automatic browser login
+  GREGMAT_CHROME_PATH Path to a Chrome/Chromium binary for browser login (default: system Chrome, then bundled Chromium)
   GREGMAT_TEST_DATE   GRE date, YYYY-MM-DD (default 2026-11-21)
-  GREGMAT_STUDY_PLAN  Study plan slug (default the-im-overwhelmed-study-plan)
+  GREGMAT_STUDY_PLAN  Parent study plan slug (default the-im-overwhelmed-study-plan)
   GREGMAT_MCP_HOME    Data dir for session.json/log.json (default ~/.gregmat-mcp)
   GREGMAT_API_BASE    Override API base URL
+  GREGMAT_CACHE_TTL_MS  /ps/questions cache lifetime in ms (default 300000)
   GREGMAT_DEBUG=1     Verbose stderr logging (never prints secrets)
 `;
 
@@ -37,6 +44,11 @@ async function main(): Promise<void> {
   if (args.includes("--self-test") || args.includes("--check")) {
     const { runSelfTest } = await import("./selftest.js");
     process.exitCode = await runSelfTest();
+    return;
+  }
+  if (args.includes("--login")) {
+    const { runLogin } = await import("./login.js");
+    process.exitCode = await runLogin();
     return;
   }
   const unknown = args.filter((a) => a.startsWith("-"));

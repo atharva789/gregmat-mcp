@@ -36,7 +36,7 @@ export function toToolError(err: unknown, endpoint?: string): ToolError {
       endpoint: endpoint ?? "/authentication/me/",
       status: null,
       hint:
-        "Set GREGMAT_TOKEN (piniaAccess cookie value), GREGMAT_COOKIE, or GREGMAT_EMAIL + GREGMAT_PASSWORD in the MCP server env, then run `npm run check`. If auth endpoints changed, edit src/config.ts",
+        "Run `gregmat-mcp --login` (browser sign-in, Google works) or set GREGMAT_TOKEN / GREGMAT_COOKIE / GREGMAT_EMAIL+GREGMAT_PASSWORD (browser login needs a display; use xvfb-run on headless Linux), then run `npm run check`. See README. If endpoints changed, edit src/config.ts",
       attempts: err.attempts,
     };
   }
